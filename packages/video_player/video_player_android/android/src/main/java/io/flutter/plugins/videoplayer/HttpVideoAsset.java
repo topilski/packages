@@ -53,6 +53,10 @@ final class HttpVideoAsset extends VideoAsset {
     }
     if (mimeType != null) {
       builder.setMimeType(mimeType);
+    } else {
+      if (assetUrl.toLowerCase().contains("m3u8")) {
+        builder.setMimeType(MimeTypes.APPLICATION_M3U8);
+      }
     }
     return builder.build();
   }
