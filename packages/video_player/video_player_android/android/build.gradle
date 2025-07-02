@@ -40,12 +40,13 @@ android {
     }
 
     dependencies {
-        def exoplayer_version = "1.5.1"
+        def exoplayer_version = "1.7.1"
         implementation "androidx.media3:media3-exoplayer:${exoplayer_version}"
         implementation "androidx.media3:media3-exoplayer-hls:${exoplayer_version}"
         implementation "androidx.media3:media3-exoplayer-dash:${exoplayer_version}"
         implementation "androidx.media3:media3-exoplayer-rtsp:${exoplayer_version}"
         implementation "androidx.media3:media3-exoplayer-smoothstreaming:${exoplayer_version}"
+        implementation "androidx.media3:media3-datasource-rtmp:${exoplayer_version}"
         testImplementation 'junit:junit:4.13.2'
         testImplementation 'androidx.test:core:1.6.1'
         testImplementation 'org.mockito:mockito-inline:5.2.0'
