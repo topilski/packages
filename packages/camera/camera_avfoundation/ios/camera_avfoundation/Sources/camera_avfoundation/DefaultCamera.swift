@@ -10,6 +10,14 @@ import CoreMotion
 #endif
 
 final class DefaultCamera: FLTCam, Camera {
+  override var videoFormat: FourCharCode {
+    didSet {
+      captureVideoOutput.videoSettings = [
+        kCVPixelBufferPixelFormatTypeKey as String: videoFormat
+      ]
+    }
+  }
+
   override var deviceOrientation: UIDeviceOrientation {
     get { super.deviceOrientation }
     set {
@@ -52,6 +60,34 @@ final class DefaultCamera: FLTCam, Camera {
       details: error.domain)
   }
 
+  private static func createConnection(
+    captureDevice: FLTCaptureDevice,
+    videoFormat: FourCharCode,
+    captureDeviceInputFactory: FLTCaptureDeviceInputFactory
+  ) throws -> (FLTCaptureInput, FLTCaptureVideoDataOutput, AVCaptureConnection) {
+    // Setup video capture input.
+    let captureVideoInput = try captureDeviceInputFactory.deviceInput(with: captureDevice)
+
+    // Setup video capture output.
+    let captureVideoOutput = FLTDefaultCaptureVideoDataOutput(
+      captureVideoOutput: AVCaptureVideoDataOutput())
+    captureVideoOutput.videoSettings = [
+      kCVPixelBufferPixelFormatTypeKey as String: videoFormat
+    ]
+    captureVideoOutput.alwaysDiscardsLateVideoFrames = true
+
+    // Setup video capture connection.
+    let connection = AVCaptureConnection(
+      inputPorts: captureVideoInput.ports,
+      output: captureVideoOutput.avOutput)
+
+    if captureDevice.position == .front {
+      connection.isVideoMirrored = true
+    }
+
+    return (captureVideoInput, captureVideoOutput, connection)
+  }
+
   func reportInitializationState() {
     // Get all the state on the current thread, not the main thread.
     let state = FCPPlatformCameraState.make(
@@ -86,6 +122,153 @@ final class DefaultCamera: FLTCam, Camera {
     audioCaptureSession.stopRunning()
   }
 
+  func startVideoRecording(
+    completion: @escaping (FlutterError?) -> Void,
+    messengerForStreaming messenger: FlutterBinaryMessenger?
+  ) {
+    guard !isRecording else {
+      completion(
+        FlutterError(
+          code: "Error",
+          message: "Video is already recording",
+          details: nil))
+      return
+    }
+
+    if let messenger = messenger {
+      startImageStream(with: messenger) { [weak self] error in
+        self?.setUpVideoRecording(completion: completion)
+      }
+      return
+    }
+
+    setUpVideoRecording(completion: completion)
+  }
+
+  /// Main logic to setup the video recording.
+  private func setUpVideoRecording(completion: @escaping (FlutterError?) -> Void) {
+    let videoRecordingPath: String
+    do {
+      videoRecordingPath = try getTemporaryFilePath(
+        withExtension: "mp4",
+        subfolder: "videos",
+        prefix: "REC_")
+      self.videoRecordingPath = videoRecordingPath
+    } catch let error as NSError {
+      completion(DefaultCamera.flutterErrorFromNSError(error))
+      return
+    }
+
+    guard setupWriter(forPath: videoRecordingPath) else {
+      completion(
+        FlutterError(
+          code: "IOError",
+          message: "Setup Writer Failed",
+          details: nil))
+      return
+    }
+
+    // startWriting should not be called in didOutputSampleBuffer where it can cause state
+    // in which isRecording is true but videoWriter.status is .unknown
+    // in stopVideoRecording if it is called after startVideoRecording but before
+    // didOutputSampleBuffer had chance to call startWriting and lag at start of video
+    // https://github.com/flutter/flutter/issues/132016
+    // https://github.com/flutter/flutter/issues/151319
+    videoWriter?.startWriting()
+    isFirstVideoSample = true
+    isRecording = true
+    isRecordingPaused = false
+    videoTimeOffset = CMTime.zero
+    audioTimeOffset = CMTime.zero
+    videoIsDisconnected = false
+    audioIsDisconnected = false
+    completion(nil)
+  }
+
+  private func setupWriter(forPath path: String) -> Bool {
+    setUpCaptureSessionForAudioIfNeeded()
+
+    var error: NSError?
+    videoWriter = assetWriterFactory(URL(fileURLWithPath: path), AVFileType.mp4, &error)
+
+    guard let videoWriter = videoWriter else {
+      if let error = error {
+        reportErrorMessage(error.description)
+      }
+      return false
+    }
+
+    var videoSettings = mediaSettingsAVWrapper.recommendedVideoSettingsForAssetWriter(
+      withFileType:
+        AVFileType.mp4,
+      for: captureVideoOutput
+    )
+
+    if mediaSettings.videoBitrate != nil || mediaSettings.framesPerSecond != nil {
+      var compressionProperties: [String: Any] = [:]
+
+      if let videoBitrate = mediaSettings.videoBitrate {
+        compressionProperties[AVVideoAverageBitRateKey] = videoBitrate
+      }
+
+      if let framesPerSecond = mediaSettings.framesPerSecond {
+        compressionProperties[AVVideoExpectedSourceFrameRateKey] = framesPerSecond
+      }
+
+      videoSettings?[AVVideoCompressionPropertiesKey] = compressionProperties
+    }
+
+    let videoWriterInput = mediaSettingsAVWrapper.assetWriterVideoInput(
+      withOutputSettings: videoSettings)
+    self.videoWriterInput = videoWriterInput
+
+    let sourcePixelBufferAttributes: [String: Any] = [
+      kCVPixelBufferPixelFormatTypeKey as String: videoFormat
+    ]
+
+    videoAdaptor = inputPixelBufferAdaptorFactory(videoWriterInput, sourcePixelBufferAttributes)
+
+    videoWriterInput.expectsMediaDataInRealTime = true
+
+    // Add the audio input
+    if mediaSettings.enableAudio {
+      var audioChannelLayout = AudioChannelLayout()
+      audioChannelLayout.mChannelLayoutTag = kAudioChannelLayoutTag_Mono
+
+      let audioChannelLayoutData = withUnsafeBytes(of: &audioChannelLayout) { Data($0) }
+
+      var audioSettings: [String: Any] = [
+        AVFormatIDKey: kAudioFormatMPEG4AAC,
+        AVSampleRateKey: 44100.0,
+        AVNumberOfChannelsKey: 1,
+        AVChannelLayoutKey: audioChannelLayoutData,
+      ]
+
+      if let audioBitrate = mediaSettings.audioBitrate {
+        audioSettings[AVEncoderBitRateKey] = audioBitrate
+      }
+
+      let newAudioWriterInput = mediaSettingsAVWrapper.assetWriterAudioInput(
+        withOutputSettings: audioSettings)
+      newAudioWriterInput.expectsMediaDataInRealTime = true
+      mediaSettingsAVWrapper.addInput(newAudioWriterInput, to: videoWriter)
+      self.audioWriterInput = newAudioWriterInput
+      audioOutput.setSampleBufferDelegate(self, queue: captureSessionQueue)
+    }
+
+    if flashMode == .torch {
+      try? captureDevice.lockForConfiguration()
+      captureDevice.torchMode = .on
+      captureDevice.unlockForConfiguration()
+    }
+
+    mediaSettingsAVWrapper.addInput(videoWriterInput, to: videoWriter)
+
+    captureVideoOutput.setSampleBufferDelegate(self, queue: captureSessionQueue)
+
+    return true
+  }
+
   func pauseVideoRecording() {
     isRecordingPaused = true
     videoIsDisconnected = true
@@ -94,6 +277,40 @@ final class DefaultCamera: FLTCam, Camera {
 
   func resumeVideoRecording() {
     isRecordingPaused = false
+  }
+
+  func stopVideoRecording(completion: @escaping (String?, FlutterError?) -> Void) {
+    guard isRecording else {
+      let error = NSError(
+        domain: NSCocoaErrorDomain,
+        code: URLError.resourceUnavailable.rawValue,
+        userInfo: [NSLocalizedDescriptionKey: "Video is not recording!"]
+      )
+      completion(nil, DefaultCamera.flutterErrorFromNSError(error))
+      return
+    }
+
+    isRecording = false
+
+    // When `isRecording` is true `startWriting` was already called so `videoWriter.status`
+    // is always either `.writing` or `.failed` and `finishWriting` does not throw exceptions so
+    // there is no need to check `videoWriter.status`
+    videoWriter?.finishWriting { [weak self] in
+      guard let strongSelf = self else { return }
+
+      if strongSelf.videoWriter?.status == .completed {
+        strongSelf.updateOrientation()
+        completion(strongSelf.videoRecordingPath, nil)
+        strongSelf.videoRecordingPath = nil
+      } else {
+        completion(
+          nil,
+          FlutterError(
+            code: "IOError",
+            message: "AVAssetWriter could not finish writing!",
+            details: nil))
+      }
+    }
   }
 
   func lockCaptureOrientation(_ pigeonOrientation: FCPPlatformDeviceOrientation) {
@@ -339,6 +556,94 @@ final class DefaultCamera: FLTCam, Camera {
 
   func resumePreview() {
     isPreviewPaused = false
+  }
+
+  func setDescriptionWhileRecording(
+    _ cameraName: String, withCompletion completion: @escaping (FlutterError?) -> Void
+  ) {
+    guard isRecording else {
+      completion(
+        FlutterError(
+          code: "setDescriptionWhileRecordingFailed",
+          message: "Device was not recording",
+          details: nil))
+      return
+    }
+
+    captureDevice = captureDeviceFactory(cameraName)
+
+    let oldConnection = captureVideoOutput.connection(withMediaType: .video)
+
+    // Stop video capture from the old output.
+    captureVideoOutput.setSampleBufferDelegate(nil, queue: nil)
+
+    // Remove the old video capture connections.
+    videoCaptureSession.beginConfiguration()
+    videoCaptureSession.removeInput(captureVideoInput)
+    videoCaptureSession.removeOutput(captureVideoOutput.avOutput)
+
+    let newConnection: AVCaptureConnection
+
+    do {
+      (captureVideoInput, captureVideoOutput, newConnection) = try DefaultCamera.createConnection(
+        captureDevice: captureDevice,
+        videoFormat: videoFormat,
+        captureDeviceInputFactory: captureDeviceInputFactory)
+
+      captureVideoOutput.setSampleBufferDelegate(self, queue: captureSessionQueue)
+    } catch {
+      completion(
+        FlutterError(
+          code: "VideoError",
+          message: "Unable to create video connection",
+          details: nil))
+      return
+    }
+
+    // Keep the same orientation the old connections had.
+    if let oldConnection = oldConnection, newConnection.isVideoOrientationSupported {
+      newConnection.videoOrientation = oldConnection.videoOrientation
+    }
+
+    // Add the new connections to the session.
+    if !videoCaptureSession.canAddInput(captureVideoInput) {
+      completion(
+        FlutterError(
+          code: "VideoError",
+          message: "Unable to switch video input",
+          details: nil))
+    }
+    videoCaptureSession.addInputWithNoConnections(captureVideoInput)
+
+    if !videoCaptureSession.canAddOutput(captureVideoOutput.avOutput) {
+      completion(
+        FlutterError(
+          code: "VideoError",
+          message: "Unable to switch video output",
+          details: nil))
+    }
+    videoCaptureSession.addOutputWithNoConnections(captureVideoOutput.avOutput)
+
+    if !videoCaptureSession.canAddConnection(newConnection) {
+      completion(
+        FlutterError(
+          code: "VideoError",
+          message: "Unable to switch video connection",
+          details: nil))
+    }
+    videoCaptureSession.addConnection(newConnection)
+    videoCaptureSession.commitConfiguration()
+
+    completion(nil)
+  }
+
+  func stopImageStream() {
+    if isStreamingImages {
+      isStreamingImages = false
+      imageStreamHandler = nil
+    } else {
+      reportErrorMessage("Images from camera are not streaming!")
+    }
   }
 
   func captureOutput(
@@ -590,5 +895,9 @@ final class DefaultCamera: FLTCam, Camera {
         // Ignore any errors, as this is just an event broadcast.
       }
     }
+  }
+
+  deinit {
+    motionManager.stopAccelerometerUpdates()
   }
 }
